@@ -1,0 +1,708 @@
+---
+title: "Stacked Regressions to predict House Prices: in R"
+author: "Pritha Chaudhuri"
+date: "5/26/2020"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+<style> p.caption {font-weight: bold;} </style>
+
+<div style="margin-bottom:100px;">
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = FALSE)
+```
+
+Recreating [Stacked Regressions to predict House Prices](https://www.kaggle.com/serigne/stacked-regressions-top-4-on-leaderboard) notebook in R using data from [House Prices: Advanced Regression Techniques](https://www.kaggle.com/c/house-prices-advanced-regression-techniques/overview) competition in Kaggle. 
+
+```{r}
+library(pacman) # package to install and load packages with one command
+p_load(tidyverse,ggplot2,reshape2,moments,glmnet,ranger,gbm,xgboost)
+set.seed(123)
+# select <- dplyr::select
+
+## Header for tabset
+# catHeader <- function(text = "", level = 3) {
+#   cat(paste0("\n\n",paste(rep("#", level),collapse="")," ",text,"\n"))
+# }
+```
+
+### Dataset
+```{r}
+# Import train and test data
+train <- read.csv("data/train.csv", header = T, stringsAsFactors = F)
+test <- read.csv("data/test.csv", header = T, stringsAsFactors = F)
+```
+
+**Train dataset**
+```{r}
+head(train)
+```
+
+**Test dataset**
+```{r}
+head(test)
+```
+
+**Data dimensions**
+The train data dimentions before dropping Id column is `r dim(train)` and test data dimensions before dropping Id column is `r dim(test)`. 
+
+```{r}
+# Save ID column of both datasets
+train_ID <- train$Id
+test_ID <- test$Id
+
+# Remove ID column as it's not required for prediction
+# train <- train %>% select(-Id)
+# test <- test %>% select(-Id)
+```
+
+After dropping Id column, which is not required for prediction, dimension of the train dataset is `r dim(train)` and dimension of the test dataset is `r dim(test)`. 
+
+## Data Processing
+
+### Outliers
+Data documentation shows outliers in the training data. What do these outliers look like?
+```{r}
+train %>% 
+  ggplot(aes(GrLivArea, SalePrice)) +
+  geom_point(shape = 19, color = "blue") +
+  theme_minimal() + 
+  theme(text = element_text(size = 13))
+```
+
+Two observations with large GrLivArea (above ground living area sq feet) have low price. Since they are outlier remove them.
+
+```{r}
+train <- train %>% 
+  filter(!(GrLivArea > 4000 & SalePrice < 300000))
+
+train %>% 
+  ggplot(aes(GrLivArea, SalePrice)) +
+  geom_point(shape = 19, color = "blue") +
+  theme_minimal() + 
+  theme(text = element_text(size = 13))
+```
+
+### Target Variable
+Looking at the **SalePrice** variable more closely.
+
+```{r}
+# Fit normal distribution on SalePrice
+saleprice_fit <- MASS::fitdistr(train$SalePrice, densfun = "normal")
+
+saleprice_fit
+```
+After fitting a normal distribution on SalePrice, the parameters are
+mean = `r saleprice_fit$estimate[1]` 
+sd = `r saleprice_fit$estimate[2]`
+
+**SalePrice Distribution**
+```{r}
+# Plot the distribution
+ggplot(train, aes(x=SalePrice)) + 
+  geom_histogram(aes(y = ..density..), color = "lightblue", fill = "lightblue", bins = 50) +
+  geom_density(aes(color = "Data"),color = "blue", size = 1) + 
+  theme_minimal() +
+  ylab("Frequency") +
+  stat_function(aes(color = "Normal dist."), fun = dnorm, args = list(mean = saleprice_fit$estimate[1], sd = saleprice_fit$estimate[2]), color = "black", size = 1, show.legend = T) +
+  scale_colour_manual("Density", values = c("blue", "black"))
+```
+Target variable is right skewed. 
+
+**Probability Plot**
+```{r}
+ggplot(train, aes(sample = SalePrice)) + 
+  stat_qq(shape = 19, color = "blue") + 
+  stat_qq_line(color = "red", size = 1) +
+  theme_minimal() +
+  xlab("Theoretical quantiles") + 
+  ylab("Ordered Values")
+```
+
+#### Log-transformation of the target variable
+Since linear models fit well with normally distributed data, transform SalePrice to be more normally distributed. 
+
+```{r}
+train <- train %>% 
+  mutate(lSalePrice = log1p(SalePrice))
+
+lsaleprice_fit <- MASS::fitdistr(train$lSalePrice, densfun = "normal")
+
+lsaleprice_fit
+```
+
+The parameters for log-transformed SalePrice are
+mean = `r lsaleprice$estimate[1]` 
+sd = `r lsaleprice$estimate[2]`
+
+**Log-transformed SalePrice Distribution**
+```{r}
+ggplot(train, aes(x=lSalePrice)) + 
+  geom_histogram(aes(y = ..density..), color = "lightblue", fill = "lightblue", bins = 50) +
+  geom_density(aes(color = "Data"),color = "blue", size = 1) + 
+  theme_minimal() +
+  ylab("Frequency") +
+  stat_function(aes(color = "Normal dist."), fun = dnorm, args = list(mean = lsaleprice_fit$estimate[1], sd = lsaleprice_fit$estimate[2]), color = "black", size = 1, show.legend = T) +
+  scale_colour_manual("Density", values = c("blue", "black"))
+```
+Data appears more normally distributed.
+
+**Probability Plot**
+```{r}
+ggplot(train, aes(sample = lSalePrice)) + 
+  stat_qq(shape = 19, color = "blue") + 
+  stat_qq_line(color = "red", size = 1) +
+  theme_minimal() +
+  xlab("Theoretical quantiles") + 
+  ylab("Ordered Values")
+```
+
+### Features engineering 
+Concatenate test and train data to create single dataframe.
+```{r}
+# Save SalePrice from training dataset
+# train_y <- train$SalePrice
+# Create single dataframe
+# all_data <- bind_rows(train,test) %>% 
+#   select(-SalePrice, -lSalePrice)
+
+all_data <- bind_rows(train,test)
+dim(all_data)
+```
+
+Dimensions of the new dataset is `r dim(all_data)`.
+
+#### Missing Data
+```{r}
+calc_missing <- function(data){
+  data_na <- data %>% 
+    summarise_all(~sum(is.na(.))*100/length(.)) %>%
+    gather("variable", "MissingRatio") %>%
+    arrange(desc(MissingRatio)) %>% 
+    filter(MissingRatio > 0)
+  
+  return(data_na)
+}
+
+calc_missing(all_data) %>%
+  head(20)
+```
+
+**Percent Missing Data by Feature**
+```{r}
+calc_missing(all_data) %>% 
+  mutate(var = factor(variable, levels = unique(variable))) %>% 
+  ggplot(aes(var, MissingRatio, label = variable, fill = variable)) + 
+  geom_bar(stat = "identity", show.legend = F) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+**Data Correlation**
+```{r}
+# Create correlation matrix for training data
+corrmat <- round(cor(train[, !sapply(train, is.character)],use = "pairwise.complete.obs"), 2)
+corrmat_melt <- melt(corrmat)
+
+ggplot(corrmat_melt, aes(Var1, Var2, fill = value)) + 
+  geom_tile(color = "white") + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+#### Imputing Missing Data
+```{r}
+# For following variables, NA means this feature does not exist in the house. So we will replace the NA values with "None". 
+nonecols <- c("PoolQC", "MiscFeature", "Alley", "Fence", "FireplaceQu", "GarageType", 
+              "GarageFinish", "GarageQual", "GarageCond", "BsmtQual", "BsmtCond", 
+              "BsmtExposure", "BsmtFinType1", "BsmtFinType2", "MasVnrType", "MSSubClass")
+# NA means 0 for these features
+zerocols <- c("GarageYrBlt", "GarageArea", "GarageCars", "BsmtFinSF1", "BsmtFinSF2",
+              "BsmtUnfSF", "TotalBsmtSF", "BsmtFullBath", "BsmtHalfBath", "MasVnrArea")
+# Fill NAs with most common value (mode)
+modecols <- c("MSZoning", "Electrical", "KitchenQual", "Exterior1st",
+              "Exterior2nd", "SaleType")
+get_mode <- function(v){
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+# Functional NA means typical (Typ)
+
+all_data <- all_data %>% 
+  mutate_at(nonecols, ~replace_na(., "None")) %>% 
+  mutate_at(zerocols, ~replace_na(., 0)) %>% 
+  mutate_at(modecols, ~if_else(is.na(.),get_mode(.),.)) %>% 
+  mutate(Functional = if_else(is.na(Functional), "Typ", Functional)) %>% 
+  select(-Utilities) %>% 
+  group_by(Neighborhood) %>% 
+  mutate(LotFrontage = if_else(is.na(LotFrontage), as.integer(median(LotFrontage, na.rm = T)), LotFrontage)) %>% 
+  ungroup()
+
+calc_missing(all_data) %>% 
+  head(20)
+
+```
+No more missing values for X variables in the data. 
+
+#### Transforming categorical variable that should be numeric
+The notebook transforms MSSubClass into numeric, OverallCond, YrSold and MoSold into categorical. 
+```{r}
+all_data <- all_data %>% 
+  mutate(MSSubClass = as.character(MSSubClass),
+         OverallCond = as.character(OverallCond),
+         YrSold = as.character(YrSold),
+         MoSold = as.character(MoSold))
+```
+
+#### Label Encoding
+Replacing some categorical variables with ordinal numbers. Adding a new variable called **TotalSF** which is the sum of basement, first and second floor square footage.
+```{r}
+targetcols <-  c('FireplaceQu', 'BsmtQual', 'BsmtCond', 'GarageQual', 'GarageCond',
+                 'ExterQual', 'ExterCond','HeatingQC', 'PoolQC', 'KitchenQual',
+                 'BsmtFinType1', 'BsmtFinType2', 'Functional', 'Fence', 'BsmtExposure',
+                 'GarageFinish', 'LandSlope','LotShape', 'PavedDrive', 'Street', 'Alley', 
+                 'CentralAir', 'MSSubClass', 'OverallCond', 'YrSold', 'MoSold')
+
+all_data <- all_data %>% 
+  mutate_at(targetcols, ~as.numeric(as.factor(.))) %>% 
+  mutate(TotalSF = TotalBsmtSF + X1stFlrSF + X2ndFlrSF)
+
+## ALT
+# Replacing with mean of SalePrice (the target variable)
+# for(col in targetcols){
+#   varname <- paste0(col,"_tgt")
+#   targetmean <- t%>%
+#     group_by_at(col)%>%
+#     summarise(!!varname := mean(SalePrice)) # vignette("programming", "dplyr")
+#   t <- left_join(t,targetmean,by=col)
+# }
+
+# Creating new variable of total sq footage
+# all_data <- all_data %>% 
+#   mutate(TotalSF = TotalBsmtSF + X1stFlrSF + X2ndFlrSF)
+
+dim(all_data)
+```
+
+#### Skewed Features
+```{r}
+numeric_feats <- select_if(all_data, is.numeric) %>% 
+  select(-Id, -SalePrice, -lSalePrice)
+skewed_feats <- numeric_feats %>% 
+  summarise_all(~as.numeric(skewness(.))) %>% 
+  gather("variable", "Skew") %>% 
+  arrange(desc(Skew)) %>% 
+  filter(abs(Skew)>0.75)
+
+head(skewed_feats, 10)
+```
+There are `r nrow(skewed_feats)` skewed numerical features to Boxcox transform. 
+
+#### Box Cox Transformation of Skewed Features
+```{r}
+skewed_features <- skewed_feats$variable
+lambda <- 0.15
+
+all_data <- all_data %>% 
+  mutate_at(skewed_features, ~((1+.)^lambda-1)/lambda)
+
+```
+
+<!-- #### Creating dummy variables for categorial variables -->
+<!-- ```{r} -->
+<!-- # Specify the X and y variable names -->
+<!-- y <- "SalePrice" -->
+<!-- x <- setdiff(colnames(all_data), c("SalePrice", "lSalePrice", "Id")) -->
+
+<!-- # Formula to create dummies -->
+<!-- form <- as.formula(paste0("~-1+",paste(x, collapse = "+"))) -->
+
+<!-- # Create dummies -->
+<!-- all_data <- model.matrix(form, data = all_data) -->
+<!-- ``` -->
+
+
+### Split the data
+Split the data back into train and test datasets, using the Ids saved before. Note, 2 outliers have been removed from train. 
+```{r}
+train <- all_data %>% 
+  filter(Id %in% train_ID)
+
+test <- all_data %>% 
+  filter(Id %in% test_ID)
+```
+
+## Modelling
+```{r}
+# Specify the X and y variable names
+y <- "SalePrice"
+x_train <- setdiff(colnames(train), c("SalePrice", "lSalePrice", "Id"))
+x_test <- setdiff(colnames(test), c("SalePrice", "lSalePrice", "Id"))
+```
+
+### Regularization
+Using package [glmnet](https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html) to fit generalized linear models via penalized maximum likelihood. 
+```{r}
+# Create training dataset for y and X 
+train_y <- as.matrix(train[,y])
+form_train <- as.formula(paste0("~-1+",paste(x_train, collapse = "+")))
+train_x <- model.matrix(form_train, data = train)
+
+# # Creating test dataset for X
+# form_test <- as.formula(paste0("~-1+",paste(x_test, collapse = "+")))
+# test_x <- model.matrix(form_test, data = test)
+# 
+# train_x <- train_x[ ,colnames(test_x)]
+
+# Function to calculate RMSE
+calc_rmse <- function(actual,pred){
+  rmse <- sqrt(mean(pred-actual)^2)
+  return(rmse)
+}
+
+# Function to create k-fold cross-validation
+create_fold <- function(data, nfolds){
+  folds <- cut(sample(nrow(data)), breaks = nfolds, labels = F)
+  foldindex <- lapply(1:nfolds, function(x) which(folds==x, arr.ind = T))
+  return(foldindex)
+}
+```
+
+#### Lasso, Elastic Net and Ridge
+```{r, eval=F}
+totfolds <- seq(2,10,1)
+a <- c(0, 0.5, 1)
+result <- expand.grid(fold=totfolds,model=a,rmse=NA)
+
+for (row in 1:nrow(result)) {
+  cat("Row:", row, "\n")
+  model <- result$model[row]
+  nfolds <- result$fold[row]
+  i <- create_fold(train_x, nfolds)
+  rmse <- c()
+  
+  for (fold in 1:nfolds) {
+    cat(fold, " ")
+  insample <- i[[fold]]
+  lambda.min <- cv.glmnet(train_x[-insample,], train_y[-insample], alpha = model)$lambda.min
+  fit <- glmnet(train_x[-insample,], train_y[-insample], lambda = lambda.min, alpha = model)
+  pred <- predict(fit, newx = train_x[insample,], type = "link")
+  rmse[fold] <- calc_rmse(train_y[insample], pred)
+  }
+  result$rmse[row] <- mean(rmse)
+  cat("\n")
+}
+
+result %>% 
+  ggplot(aes(fold,rmse,group=as.character(model),color=as.character(model))) + 
+  geom_line()
+
+
+
+# nfolds <- 3
+# i <- create_fold(train_x, nfolds)
+# # rmse <- data.frame(matrix(NA,nfolds,length(a)))
+# # colnames(rmse) <- c("Ridge", "ENet", "Lasso")
+# model <- 1
+# for (model in 1:length(a)) {
+#   cat(model, ":")
+#   rmse <- c()
+#   for (fold in 1:nfolds) {
+#     cat(fold, " ")
+#   insample <- i[[fold]]
+#   lambda.min <- cv.glmnet(train_x[-insample,], train_y[-insample], alpha = a[model])$lambda.min
+#   fit <- glmnet(train_x[-insample,], train_y[-insample], lambda = lambda.min, alpha = a[model])
+#   pred <- predict(fit, newx = train_x[insample,], type = "link")
+#   rmse[fold] <- calc_rmse(train_y[insample], pred)
+#   }
+#   subset(result, fold==nfolds & model == model) <-  mean(rmse)
+#   cat("\n")
+# }
+# 
+# colMeans(rmse)
+# 
+# for (fold in 1:nfolds) {
+#   insample <- i[[fold]]
+#   lambda.min <- cv.glmnet(train_x[-insample,], train_y[-insample], alpha = 1)$lambda.min
+#   fit <- glmnet(train_x[-insample,], train_y[-insample], lambda = lambda.min, alpha = 1)
+#   pred <- predict(fit, newx = train_x[insample,], type = "link")
+#   rmse[fold,] <- calc_rmse(train_y[insample], pred)
+# }
+# 
+# 
+# # Use cross-validation to get min lambda
+# fit.lasso.cv <- cv.glmnet(train_x,train_y)
+# lambda.lasso <- fit.lasso.cv$lambda.min
+# 
+# fit.lasso <- glmnet(train_x,train_y)
+# predict()
+
+```
+
+#### Random Forest 
+Using help from [this website](https://uc-r.github.io/random_forests). 
+
+```{r, eval=F}
+# Using randomForest package
+rf1 <- randomForest(formula = SalePrice ~ .,
+                     data = train)
+plot(rf1) # error rate based on out-of-bag (OOB) sample error
+which.min(rf1$mse) # #trees with lowest MSE
+sqrt(rf1$mse[which.min(rf1$mse)]) # RMSE with optimal #trees
+
+# Use a validation set to measure pedictive accuracy
+# Random 80-20 split on the train data
+yalt <- setdiff(colnames(train), c("lSalePrice", "Id"))
+rftrain <- train[insample, yalt]
+rftest <- train[-insample, yalt]
+# rftrain_y <- train[insample, y]
+# rftrain_x <- train[insample, x_train]
+rftest_y <- as.matrix(train[-insample, y])
+# rftest_x <- as.matrix(train[-insample, x_train])
+##### DOES NOT WORK!!! 
+rf2 <- randomForest(x = as.matrix(train[insample, x_train]), 
+                    y = as.matrix(train[insample, y]))
+
+# Using ranger
+form <- as.formula(paste0(y,"~-1+",paste(x_train,collapse = "+")))
+fit_rf <- ranger(SalePrice ~ . , data = train[, yalt], num.trees = 500)
+# Use training and test data: fit on train, predict on test
+fit_rftain <- ranger(SalePrice ~ . ,
+                     data = rftrain,
+                     num.trees = 500)
+pred_rftest <- predict(fit_rftain, 
+                       data = rftest)$predictions
+calc_rmse(rftest_y, pred_rftest)
+```
+
+**Tuning hyper-parameters**
+```{r}
+# Hyperparameter grid search
+rf_grid <- expand.grid(trees = seq(500, 2500, by =500),
+                       mtry = seq(20, 30, by = 2), 
+                       sample_size = c(0.55, 0.632, 0.70, 0.80),
+                       rmse = NA)
+nrow(rf_grid)
+
+for (row in 1:nrow(rf_grid)) {
+  cat("Row:", row, "\n")
+  rfmodel <- ranger(SalePrice ~ . , 
+                    data = rftrain,
+                    num.trees = rf_grid$trees[row],
+                    mtry = rf_grid$mtry[row],
+                    sample.fraction = rf_grid$sample_size[row],
+                    seed = 123)
+  
+  rfpred <- predict(rfmodel, data = rftest)$predictions
+  rf_grid$rmse[row] <- calc_rmse(rftest_y, rfpred)
+}
+
+rf_grid %>% arrange(rmse) %>% head(10)
+
+
+```
+
+Use top row from above as optimal parameters and train model. Use test set to make predictions. 
+```{r}
+# Use parameters for min RMSE above as optimal parameters
+fit_rf_final <- ranger(SalePrice ~ .,
+                       data = rftrain,
+                       num.trees = rf_grid$trees[which.min(rf_grid$rmse)],
+                       mtry = rf_grid$mtry[which.min(rf_grid$rmse)],
+                       sample.fraction = rf_grid$sample_size[which.min(rf_grid$rmse)], 
+                       seed = 123)
+
+pred_rf <- predict(fit_rf_final, data = rftest)$predictions
+
+calc_rmse(rftest_y, pred_rf)
+
+```
+
+
+#### Gradient Boosting
+Add new models to the ensemble sequentially. Train weak base-learning model at each iteration and improve error by learning. Use regression trees as base models. 
+
+```{r}
+# xgboost needs separate train and test data
+# y-variables
+xgbtrain_y <- as.matrix(train[insample, y])
+xgbtest_y <- as.matrix(train[-insample, y])
+# x-variables
+xgb_cat <- model.matrix(form_train, data = train)
+xgbtrain_x <- as.matrix(xgb_cat[insample,])
+xgbtest_x <- as.matrix(xgb_cat[-insample,])
+
+# XGB model
+fit_xgb1 <- xgb.cv(data = xgbtrain_x,
+                   label = xgbtrain_y,
+                   nrounds = 1000, # ntrees
+                   nfold = 5,
+                   objective = "reg:linear", # regression models
+                   verbose = 0)
+# number of trees that minimize error
+fit_xgb1$evaluation_log %>% 
+  summarise(ntrees.train = which(train_rmse_mean == min(train_rmse_mean))[1], 
+            rmse.train = min(train_rmse_mean), 
+            ntrees.test = which(test_rmse_mean == min(test_rmse_mean))[1],
+            rmse.test = min(test_rmse_mean))
+
+# plot
+ggplot(fit_xgb1$evaluation_log) +
+  geom_line(aes(iter, train_rmse_mean), color = "red") + 
+  geom_line(aes(iter, test_rmse_mean), color = "blue") +
+  theme_minimal()
+
+```
+
+**Tuning hyperparameters**
+```{r}
+# Specify list of hyperparameters
+xgb_params <- list(eta = 0.1, # learning rate
+                   max_depth = 5, # tree depth
+                   subsample = 0.8, # % of training data to sample for each tree
+                   colsample_bytree = 0.9 # % of columns to sample from for each tree
+                   )
+
+fit_xgb2 <- xgb.cv(params = xgb_params, 
+                   data = xgbtrain_x,
+                   label = xgbtrain_y,
+                   nrounds = 1000, # ntrees
+                   nfold = 5,
+                   objective = "reg:linear", # regression models
+                   verbose = 0, 
+                   early_stopping_rounds = 10)
+
+fit_xgb2$evaluation_log %>% 
+  summarise(ntrees.train = which(train_rmse_mean == min(train_rmse_mean))[1], 
+            rmse.train = min(train_rmse_mean), 
+            ntrees.test = which(test_rmse_mean == min(test_rmse_mean))[1],
+            rmse.test = min(test_rmse_mean))
+```
+
+**Tuning hyperparameters: Grid search**
+```{r}
+# Hyperparameter grid
+xgb_grid <- expand.grid(eta = c(0.01, 0.05, 0.1, 0.3),
+                        max_depth = c(1, 3, 5, 7),
+                        subsample = c(0.65, 0.8, 1),
+                        colsample_bytree = c(0.8, 0.9, 1),
+                        opt.trees = NA,
+                        rmse = NA)
+
+for (row in 1:nrow(xgb_grid)) {
+  cat("Row:", row, "\n")
+  
+  # hypermarameters list
+  params <- list(eta = xgb_grid$eta[row], 
+                   max_depth = xgb_grid$max_depth[row], 
+                   subsample = xgb_grid$subsample[row], 
+                   colsample_bytree = xgb_grid$colsample_bytree[row] 
+                   )
+  
+  set.seed(123)
+  xgbmodel <- xgb.cv(params = params,
+                     data = xgbtrain_x,
+                     label = xgbtrain_y,
+                     nrounds = 1000, 
+                     nfold = 5,
+                     objective = "reg:linear", 
+                     verbose = 0,
+                     early_stopping_rounds = 10)
+  
+  xgb_grid$opt.trees[row] <- which.min(xgbmodel$evaluation_log$test_rmse_mean)
+  xgb_grid$rmse[row] <- min(xgbmodel$evaluation_log$test_rmse_mean)
+  
+}
+
+xgb_grid %>% arrange(rmse) %>% head(10)
+```
+
+Use top row above as optimal hyperparameters and train xgboost model. 
+```{r}
+# optimal parameters
+xgb_paramsopt <- list(eta = xgb_grid$eta[which.min(xgb_grid$rmse)],
+                      max_depth = xgb_grid$max_depth[which.min(xgb_grid$rmse)],
+                      subsample = xgb_grid$subsample[which.min(xgb_grid$rmse)],
+                      colsample_bytree = xgb_grid$colsample_bytree[which.min(xgb_grid$rmse)])
+xgb_ntree <- xgb_grid$opt.trees[which.min(xgb_grid$rmse)]
+
+fit_xgb_final <- xgboost(params = xgb_paramsopt,
+                         data = xgbtrain_x,
+                         label = xgbtrain_y,
+                         nrounds = xgb_ntree,
+                         objective = "reg:linear",
+                         verbose = 0)
+
+pred_xgb <- predict(fit_xgb_final, xgbtest_x)
+
+calc_rmse(xgbtest_y, pred_xgb)
+```
+
+
+### Simple Ensemble Techniques
+Combine predictions from various models to improve overall performance. 
+
+#### Simple Average
+Create a 80-20 random split on train dataset. Fit Lasso, ENEt and Ridge on 80% sample of training data. Predict using the 20% test dataset. Take simple average of the predictions from the 3 models. 
+```{r}
+# Create 80-20 split on train data
+insample <- sample(1:nrow(train), size=floor(nrow(train)*0.8))
+# Get y-variable from train dataset
+train_yy <- as.matrix(train[insample, y])
+test_yy <- as.matrix(train[-insample, y])
+train_avgmodel <- model.matrix(form_train, data = train)
+train_xx <- train_avgmodel[insample, ]
+test_xx <- train_avgmodel[-insample, ]
+
+models <- c(0, 0.5, 1)
+result_avg <- expand.grid(model = models, prediction = NA, rmse = NA)
+
+for (row in 1:nrow(result_avg)) {
+  model <- result_avg$model[row]
+  lambda.min <- cv.glmnet(train_xx, train_yy, alpha = model)$lambda.min
+  fit <- glmnet(train_xx, train_yy, lambda = lambda.min, alpha = model)
+  pred <- predict(fit, newx = test_xx, type = "link")
+  result_avg$prediction[row] <- mean(pred)
+  result_avg$rmse[row] <- calc_rmse(test_yy, pred)
+}
+
+mean(result_avg$prediction)
+```
+
+Mean average prediction of the 3 methods is `r mean(result_avg$prediction)`.
+
+#### Meta Model 
+* For each regularization model, train on 80% of the sample and predict on remaining 20% of sample (test). 
+* For random forest and xgboost predictions have already been saved as 'pred_rf' and 'pred_xgb'.
+* Now regress the predictions on the actual Y from the test sample. 
+```{r}
+pred_meta <- matrix(data = NA, nrow = nrow(test_yy), ncol = length(models))
+colnames(pred_meta) <- c("Ridge", "Enet", "Lasso")
+for (col in 1:length(models)) {
+  model <- models[col]
+  lambda.min <- cv.glmnet(train_xx, train_yy, alpha = model)$lambda.min
+  fit <- glmnet(train_xx, train_yy, lambda = lambda.min, alpha = model)
+  pred <- predict(fit, newx = test_xx, type = "link")
+  pred_meta[,col] <- pred
+}
+
+metareg <- bind_cols(as.data.frame(pred_meta),as.data.frame(pred_rf), as.data.frame(pred_xgb),as.data.frame(test_yy))
+colnames(metareg) <- c("Ridge", "Enet", "Lasso","RandomForest","XGBoost","SalePrice")
+
+
+agg.pred <- lm("SalePrice ~ -1 + Ridge*Enet*Lasso*RandomForest*XGBoost", data = metareg)
+agg.rf <- ranger(SalePrice ~ Ridge+Enet+Lasso+RandomForest+XGBoost,data=metareg,num.trees = 2000)
+
+metareg$agg.pred <- predict(agg.pred,data=metareg)
+metareg$avg <- rowMeans(metareg[,c("Ridge","Enet","Lasso","RandomForest","XGBoost")])
+metareg$agg.pred.rf <- predict(agg.rf,data=metareg)$predictions
+
+
+lapply(c("Ridge","Enet","Lasso","RandomForest","XGBoost","agg.pred","agg.pred.rf","avg"),
+       function(x) calc_rmse(metareg[,"SalePrice"],metareg[,x]))
+```
+
+
